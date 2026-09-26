@@ -29,6 +29,9 @@ const dayOffset = ref(0)
 const qty = ref(2)
 const guestName = ref('')
 const bookMsg = ref('')
+const bookErr = ref(null)       // 结构化错误 { code,msg,hint,trace_id }
+const booking = ref(false)
+const bookKey = ref('')         // 本次下单的幂等键：失败重试沿用，绝不重复扣款
 
 const rideSlotsMap = ref({})   // rideId -> slots
 const rideSlotsLoading = ref(false)
@@ -74,23 +77,52 @@ function slotState(s) {
   return { cls: 'open', text: `余 ${s.remain}` }
 }
 
-async function submitBook() {
-  bookMsg.value = ''
-  if (!selectedSlot.value) { bookMsg.value = '请选择入园/游玩时段'; return }
-  const r = await store.bookReservation({
-    scope: scope.value,
-    ride_id: scope.value === 'ride' ? pickRide.value : undefined,
-    slot_id: selectedSlot.value.id,
-    qty: qty.value,
-    guest_name: guestName.value
-  })
-  if (r?.ok) {
-    bookMsg.value = `预约成功！预约号 ${r.code}，预收 ¥${totalPrice.value.toLocaleString()}，请按时段核销入园`
-    guestName.value = ''
-    selectedSlot.value = null
-    if (scope.value === 'ride') await loadRideSlots()
-  } else {
-    bookMsg.value = r?.msg || '预约失败'
+// 结构化错误 → 内联文案（含错误码、提示与可报客服的追踪号）
+function errText(r) {
+  if (!r) return '操作失败，请稍后重试'
+  const parts = [r.msg || '操作失败']
+  if (r.hint) parts.push(r.hint)
+  if (r.code || r.trace_id) {
+    parts.push(`[${r.code || 'ERROR'}${r.trace_id ? ` · ${r.trace_id}` : ''}]`)
+  }
+  return parts.join(' ')
+}
+function isSoftOk(r) {
+  return r?.ok === false && (r.code === 'RSV_OVERBOOK_RESCHEDULED' || r.code === 'RSV_OVERBOOK_REFUNDED')
+}
+
+async function submitBook(retryKey = '') {
+  if (!selectedSlot.value) { bookMsg.value = '请选择入园/游玩时段'; bookErr.value = null; return }
+  if (booking.value) return                  // 提交中：屏蔽重复点击
+  booking.value = true
+  bookErr.value = null
+  bookMsg.value = retryKey ? '正在使用原请求编号安全重试…' : '正在提交并锁定名额…'
+  // 首次点击生成键，重试沿用同一键：网络抖动/双击都不会重复下单扣款
+  const key = retryKey || bookKey.value || ''
+  try {
+    const r = await store.bookReservation({
+      scope: scope.value,
+      ride_id: scope.value === 'ride' ? pickRide.value : undefined,
+      slot_id: selectedSlot.value.id,
+      qty: qty.value,
+      guest_name: guestName.value
+    }, key)
+    if (r?.ok) {
+      bookMsg.value = `预约成功！预约号 ${r.code}，预收 ¥${totalPrice.value.toLocaleString()}，请按时段核销入园`
+      bookKey.value = ''
+      guestName.value = ''
+      selectedSlot.value = null
+      if (scope.value === 'ride') await loadRideSlots()
+    } else if (isSoftOk(r)) {
+      bookMsg.value = r.msg
+      bookKey.value = ''
+    } else {
+      bookMsg.value = ''
+      bookErr.value = r
+      bookKey.value = r?.idemKey || key      // 保留键，供「安全重试」复用
+    }
+  } finally {
+    booking.value = false
   }
 }
 
@@ -136,13 +168,29 @@ const statusBadge = st => ({
   refunded_half: { cls: 'b-half', text: '退50%' }
 }[st] || { cls: '', text: st })
 
+// 单据操作进行中集合（按 id+动作），核销/改签/取消期间禁用按钮防重复提交
+const pending = ref({})
+function actKey(id, act) { return `${id}:${act}` }
+
 async function checkin(r) {
-  const res = await store.checkinReservation(r.id)
-  flash(r.id, res?.ok ? `✓ ${r.code} 已核销 ${r.qty} 人` : (res?.msg || '核销失败'), res?.ok)
+  if (pending.value[actKey(r.id, 'checkin')]) return
+  pending.value[actKey(r.id, 'checkin')] = true
+  try {
+    const res = await store.checkinReservation(r.id)
+    if (res?.ok) flash(r.id, `✓ ${r.code} 已核销 ${r.qty} 人`, true)
+    else if (isSoftOk(res)) flash(r.id, `↪ ${res.msg}`, 'warn', res)
+    else flash(r.id, errText(res), false, res)
+  } finally { pending.value[actKey(r.id, 'checkin')] = false }
 }
 async function cancel(r) {
-  const res = await store.cancelReservation(r.id)
-  flash(r.id, res?.ok ? `已取消，退款 ¥${res.back}${res.fee ? `，手续费 ¥${res.fee}` : ''}` : (res?.msg || '取消失败'), res?.ok)
+  if (pending.value[actKey(r.id, 'cancel')]) return
+  pending.value[actKey(r.id, 'cancel')] = true
+  try {
+    const res = await store.cancelReservation(r.id)
+    if (res?.ok) {
+      flash(r.id, `已取消，退款 ¥${res.back}${res.fee ? `，手续费 ¥${res.fee}` : ''}`, true)
+    } else flash(r.id, errText(res), false, res)
+  } finally { pending.value[actKey(r.id, 'cancel')] = false }
 }
 
 // 改签：展开选择其他时段
@@ -163,21 +211,39 @@ const rsCandidates = (r) => {
 }
 async function doReschedule(r) {
   const sid = +rsTarget.value[r.id]
-  if (!sid) return
-  const res = await store.rescheduleReservation(r.id, sid)
-  flash(r.id, res?.ok ? '改签成功' : (res?.msg || '改签失败'), res?.ok)
-  if (res?.ok) { rsOpen.value[r.id] = false; await loadRideSlots() }
+  if (!sid || pending.value[actKey(r.id, 'reschedule')]) return
+  pending.value[actKey(r.id, 'reschedule')] = true
+  try {
+    const res = await store.rescheduleReservation(r.id, sid)
+    if (res?.ok) {
+      flash(r.id, '改签成功（不加价）', true)
+      rsOpen.value[r.id] = false
+      await loadRideSlots()
+    } else if (res?.replayed) {
+      flash(r.id, '该改签请求已处理（重放结果），名额未重复变动', 'warn')
+    } else flash(r.id, errText(res), false, res)
+  } finally { pending.value[actKey(r.id, 'reschedule')] = false }
 }
 
 const flashes = ref({})
-function flash(id, msg, ok) { flashes.value[id] = { msg, ok: !!ok } }
+function flash(id, msg, ok, raw = null) {
+  flashes.value[id] = {
+    msg,
+    ok: ok === true,
+    warn: ok === 'warn',
+    code: raw?.code || '',
+    trace_id: raw?.trace_id || '',
+    idemKey: raw?.idemKey || ''
+  }
+}
 
 // 详情时间线
 const detail = ref(null)
 const detailLogs = ref([])
 const ACTION_LABEL = {
   create: '游客下单', auto_book: '系统代约', checkin: '核销入园', reschedule: '游客改签',
-  auto_reschedule: '超售自动改签', noshow: '爽约处理', cancel: '取消(扣手续费)', refund: '退款', split: '拆单'
+  auto_reschedule: '超售自动改签', noshow: '爽约处理', cancel: '取消(扣手续费)', refund: '退款', split: '拆单',
+  reconcile: '库存对账修复'
 }
 async function openDetail(r) {
   const d = await store.reservationDetail(r.id)
@@ -251,10 +317,26 @@ function pickDayIf(off) { return today.value + off }
           <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b></span>
           <em class="muted">提前取消全额退；当日取消退 50%；爽约不退。预约费用下单即收取。</em>
         </div>
-        <button class="primary wide" :disabled="!selectedSlot" @click="submitBook">
-          {{ selectedSlot ? `预约 第${selectedSlot.day}天 ${selectedSlot.hour}:00 · ¥${totalPrice.toLocaleString()}` : '请先选择时段' }}
+        <button class="primary wide" :disabled="!selectedSlot || booking" @click="submitBook('')">
+          <span v-if="booking">⏳ 提交中，请勿重复点击…</span>
+          <span v-else-if="selectedSlot">预约 第{{ selectedSlot.day }}天 {{ selectedSlot.hour }}:00 · ¥{{ totalPrice.toLocaleString() }}</span>
+          <span v-else>请先选择时段</span>
         </button>
-        <em v-if="bookMsg" class="bookmsg" :class="{ err: bookMsg.includes('失败') || bookMsg.includes('请') }">{{ bookMsg }}</em>
+        <em v-if="bookMsg" class="bookmsg">{{ bookMsg }}</em>
+        <div v-if="bookErr" class="bookerr">
+          <p class="be-title">❌ {{ bookErr.msg || '预约失败' }}</p>
+          <p class="be-hint" v-if="bookErr.hint">{{ bookErr.hint }}</p>
+          <p class="be-meta">
+            <span class="be-code" v-if="bookErr.code">{{ bookErr.code }}</span>
+            <span class="be-trace" v-if="bookErr.trace_id">追踪号 {{ bookErr.trace_id }}</span>
+          </p>
+          <p class="be-actions">
+            <button class="ghost" :disabled="booking" @click="submitBook(bookKey)">
+              🔁 安全重试（同请求编号，不会重复扣款）
+            </button>
+            <button class="ghost" @click="bookErr = null">关闭</button>
+          </p>
+        </div>
       </div>
 
       <div class="card slots-card">
@@ -366,9 +448,13 @@ function pickDayIf(off) { return today.value + off }
           </div>
           <div class="ti-ops">
             <template v-if="r.status === 'booked'">
-              <button class="succ" @click="checkin(r)">✅ 核销</button>
-              <button class="ghost" @click="toggleRs(r.id)">改签</button>
-              <button class="danger" @click="cancel(r)">取消退款</button>
+              <button class="succ" :disabled="pending[`${r.id}:checkin`]" @click="checkin(r)">
+                {{ pending[`${r.id}:checkin`] ? '核销中…' : '✅ 核销' }}
+              </button>
+              <button class="ghost" :disabled="pending[`${r.id}:reschedule`]" @click="toggleRs(r.id)">改签</button>
+              <button class="danger" :disabled="pending[`${r.id}:cancel`]" @click="cancel(r)">
+                {{ pending[`${r.id}:cancel`] ? '退款中…' : '取消退款' }}
+              </button>
             </template>
             <button class="ghost" @click="openDetail(r)">时间线</button>
           </div>
@@ -380,9 +466,17 @@ function pickDayIf(off) { return today.value + off }
                 第{{ s.day }}天 {{ s.hour }}:00 · 余 {{ s.remain }}{{ s.scope === 'ride' ? ` · ${s.ride_name}` : '' }}
               </option>
             </select>
-            <button class="primary" :disabled="!rsTarget[r.id]" @click="doReschedule(r)">确认改签（不加价）</button>
+            <button class="primary" :disabled="!rsTarget[r.id] || pending[`${r.id}:reschedule`]" @click="doReschedule(r)">
+              {{ pending[`${r.id}:reschedule`] ? '改签中…' : '确认改签（不加价）' }}
+            </button>
           </div>
-          <em v-if="flashes[r.id]" class="flash" :class="{ ok: flashes[r.id].ok, err: !flashes[r.id].ok }">{{ flashes[r.id].msg }}</em>
+          <div v-if="flashes[r.id]" class="flash-box" :class="{ ok: flashes[r.id].ok, err: !flashes[r.id].ok && !flashes[r.id].warn, warn: flashes[r.id].warn }">
+            <span class="flash-msg">{{ flashes[r.id].msg }}</span>
+            <span class="flash-meta" v-if="flashes[r.id].code || flashes[r.id].trace_id">
+              <i class="be-code" v-if="flashes[r.id].code">{{ flashes[r.id].code }}</i>
+              <i class="be-trace" v-if="flashes[r.id].trace_id">追踪号 {{ flashes[r.id].trace_id }}</i>
+            </span>
+          </div>
         </div>
         <div class="muted empty card" v-if="!filteredTickets.length">
           {{ tFilter === 'active' ? '当前没有待核销预约单。' : '暂无预约记录。' }}
@@ -447,8 +541,16 @@ function pickDayIf(off) { return today.value + off }
 .quote { background: var(--panel2); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; margin-bottom: 12px; }
 .quote em { font-size: 11px; line-height: 1.5; }
 .wide { width: 100%; padding: 11px; }
+.wide:disabled { opacity: .65; cursor: not-allowed; }
 .bookmsg { display: block; margin-top: 10px; font-size: 12.5px; color: var(--green); font-style: normal; }
-.bookmsg.err { color: var(--red); }
+.bookerr { margin-top: 10px; border: 1px solid rgba(255,107,107,.5); background: rgba(255,107,107,.08); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.bookerr .be-title { font-size: 13px; color: #ff9b9b; }
+.bookerr .be-hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+.bookerr .be-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.bookerr .be-actions { display: flex; gap: 8px; }
+.bookerr .be-actions button { font-size: 12px; }
+.be-code { font-family: ui-monospace, Menlo, monospace; font-style: normal; font-size: 10.5px; background: rgba(255,107,107,.16); border: 1px solid rgba(255,107,107,.4); color: #ffb0b0; border-radius: 5px; padding: 1px 6px; }
+.be-trace { font-family: ui-monospace, Menlo, monospace; font-style: normal; font-size: 10.5px; color: var(--muted); }
 
 .slot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 10px; }
 .slot { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; padding: 10px; border-radius: 10px; position: relative; text-align: left; }
@@ -504,9 +606,12 @@ function pickDayIf(off) { return today.value + off }
 .b-half { color: var(--purple) !important; border-color: rgba(167,139,250,.5) !important; }
 .rs-box { display: flex; gap: 8px; align-items: center; }
 .rs-box select { flex: 1; max-width: 420px; }
-.flash { font-style: normal; font-size: 12.5px; }
-.flash.ok { color: var(--green); }
-.flash.err { color: var(--red); }
+.flash-box { font-style: normal; font-size: 12.5px; display: flex; flex-direction: column; gap: 4px; border-radius: 8px; padding: 7px 10px; }
+.flash-box.ok { color: var(--green); background: rgba(109,213,160,.08); }
+.flash-box.err { color: #ff9b9b; background: rgba(255,107,107,.08); }
+.flash-box.warn { color: var(--accent2); background: rgba(255,209,102,.08); }
+.flash-box .flash-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.flash-box .be-code, .flash-box .be-trace { font-size: 10.5px; }
 
 /* 详情 */
 .mask { position: fixed; inset: 0; background: rgba(5,8,18,.65); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; }

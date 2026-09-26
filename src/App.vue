@@ -84,6 +84,22 @@ onMounted(store.refresh)
         <ReportsView v-else />
       </section>
     </main>
+
+    <!-- 全局可追踪错误：系统/网络级失败在此浮层提示，业务校验错误在页面内联展示 -->
+    <div class="toast-stack">
+      <div v-for="t in store.toasts" :key="t.id" class="toast">
+        <div class="t-head">
+          <b>⚠️ 操作未完成</b>
+          <button class="t-x" @click="store.dismissToast(t.id)">✕</button>
+        </div>
+        <p class="t-msg">{{ t.msg }}</p>
+        <p class="t-hint" v-if="t.hint">{{ t.hint }}</p>
+        <p class="t-trace">
+          <span class="t-code" v-if="t.code">{{ t.code }}</span>
+          <span class="t-id" v-if="t.trace_id">追踪号 {{ t.trace_id }}（联系客服时报此号）</span>
+        </p>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -118,4 +134,15 @@ main { flex: 1; min-width: 0; }
 .pill b { color: var(--text); margin-left: 4px; }
 .pill em { font-style: normal; color: #ff8080; margin-left: 4px; }
 .pill.debt-warn { border-color: rgba(255,80,80,.55); background: rgba(255,80,80,.12); }
+
+/* 全局可追踪错误浮层 */
+.toast-stack { position: fixed; top: 16px; right: 16px; z-index: 100; display: flex; flex-direction: column; gap: 10px; width: min(380px, calc(100vw - 32px)); }
+.toast { background: rgba(40,18,22,.96); border: 1px solid rgba(255,107,107,.6); border-radius: 12px; padding: 12px 14px; box-shadow: 0 10px 30px rgba(0,0,0,.45); }
+.toast .t-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.toast .t-x { background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 13px; padding: 2px 6px; }
+.toast .t-msg { font-size: 13px; line-height: 1.5; margin-bottom: 4px; }
+.toast .t-hint { font-size: 12px; color: var(--muted); line-height: 1.5; margin-bottom: 6px; }
+.toast .t-trace { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 11px; }
+.toast .t-code { font-family: ui-monospace, Menlo, monospace; background: rgba(255,107,107,.16); border: 1px solid rgba(255,107,107,.4); color: #ffb0b0; border-radius: 6px; padding: 1px 7px; }
+.toast .t-id { color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
 </style>

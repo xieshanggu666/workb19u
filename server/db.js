@@ -219,6 +219,20 @@ CREATE TABLE IF NOT EXISTS reservation_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_reservation_logs_rid ON reservation_logs(reservation_id);
 
+-- 幂等请求记录：下单/改签/退款/核销等写操作凭 Idempotency-Key 去重，重放首次结果
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key TEXT NOT NULL PRIMARY KEY,           -- 客户端生成的请求标识（UUID）
+  scope TEXT NOT NULL DEFAULT '',          -- 业务域（reservation）
+  method TEXT NOT NULL DEFAULT '',         -- HTTP 方法
+  path TEXT NOT NULL DEFAULT '',           -- 请求路径（含预约单 id）
+  fingerprint TEXT NOT NULL DEFAULT '',    -- 请求体指纹：同 key 但载荷不同视为冲突
+  status_code INTEGER NOT NULL DEFAULT 200,
+  response TEXT NOT NULL DEFAULT '',       -- 首次成功响应（JSON 原样回放）
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_idem_scope ON idempotency_keys(scope, created_day);
+
 -- 设施检修工单：报修后进入排队，维修员工接单后按游戏时间推进，支持转派与离岗接续
 CREATE TABLE IF NOT EXISTS maintenance_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -337,6 +351,43 @@ function seed() {
     f.run(0, 0, '维护', -9000, '昨日设施维护')
   }
 }
+// ---------------- 事务工具 ----------------
+// 业务层全部为 node:sqlite 同步调用（无 await 穿插），故以模块级深度计数实现
+// 可嵌套事务：顶层 BEGIN IMMEDIATE 立即获取写锁（杜绝并发连接的读-改-写竞争），
+// 内层以 SAVEPOINT 隔离；任一层抛错即回滚到对应保存点（顶层整体 ROLLBACK）。
+let _txDepth = 0
+
+export function tx(fn) {
+  if (_txDepth === 0) {
+    db.exec('BEGIN IMMEDIATE')
+    _txDepth = 1
+    try {
+      const out = fn()
+      db.exec('COMMIT')
+      _txDepth = 0
+      return out
+    } catch (err) {
+      try { db.exec('ROLLBACK') } catch { /* 连接异常时交由 SQLite 自动回滚 */ }
+      _txDepth = 0
+      throw err
+    }
+  }
+  const sp = `sp_${_txDepth}`
+  db.exec(`SAVEPOINT ${sp}`)
+  _txDepth += 1
+  try {
+    const out = fn()
+    db.exec(`RELEASE SAVEPOINT ${sp}`)
+    _txDepth -= 1
+    return out
+  } catch (err) {
+    db.exec(`ROLLBACK TO SAVEPOINT ${sp}`)
+    db.exec(`RELEASE SAVEPOINT ${sp}`)
+    _txDepth -= 1
+    throw err
+  }
+}
+
 seed()
 
 export default db

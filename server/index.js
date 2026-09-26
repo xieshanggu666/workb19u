@@ -2,11 +2,13 @@ import express from 'express'
 import db, { getSetting, setSetting } from './db.js'
 import {
   initReservationContext, ensureSlots, syncRideSlots,
-  autoCheckin, expireNoShow, autoBookDemand,
+  autoCheckin, expireNoShow, autoBookDemand, reconcileSlots,
   createReservation, cancelReservation, rescheduleReservation, checkinReservation,
   listSlots, listReservations, reservationLogs, updateSlot, reservationStats,
-  refundReservation
+  refundReservation, requireOk
 } from './reservations.js'
+import { ApiError, errorHandler } from './errors.js'
+import { idempotent } from './idempotency.js'
 import {
   initMaintenanceContext, backfillMaintenanceOrders, processMaintenance,
   createMaintenanceOrder, assignMaintenanceOrder, cancelMaintenanceOrder,
@@ -478,7 +480,11 @@ function tick() {
 
   // ---- 分时预约闭环 ----
   ensureSlots()                       // 维护未来三天的入园/设施时段库存
-  expireNoShow(hour)                  // 过时段未核销 → 爽约，预收款没收
+  const noshowResult = expireNoShow(hour)  // 过时段未核销 → 爽约，预收款没收
+  if (noshowResult.failures.length) {
+    console.error(`[reservations] 第${day}天${hour}时 爽约批处理有 ${noshowResult.failures.length} 单失败：`,
+      noshowResult.failures.map(f => `${f.code || f.id}:${f.code_type}`).join('，'))
+  }
   // 入园时段（9~18点）核销当前时段预约：容量内放行，超售自动改签/退款
   let reservedEntry = 0
   const reservedRiders = new Map()
@@ -486,6 +492,11 @@ function tick() {
     const arrival = autoCheckin(hour)
     reservedEntry = arrival.entry
     arrival.ride.forEach((qty, rid) => reservedRiders.set(rid, qty))
+    if (arrival.failures.length) {
+      // 单单异常已自动回滚，下一 tick 仍为 booked 可重试；服务端留痕供 trace 追踪
+      console.error(`[reservations] 第${day}天${hour}时 自动核销有 ${arrival.failures.length} 单失败（已回滚，下轮重试）：`,
+        arrival.failures.map(f => `${f.code || f.id}:${f.code_type}`).join('，'))
+    }
   }
 
   // 入园人数模型（散客侧：预约到场已计入实际客流，不再重复收取门票）
@@ -681,6 +692,16 @@ function checkBrokenDown(day) {
 // 兼容既有检修状态：为已停运检修但无在途工单的设施补建排队工单
 backfillMaintenanceOrders()
 
+// 启动异常恢复：以预约单为事实来源对账时段库存计数器，修复历史半成品事务造成的漂移
+try {
+  const recon = reconcileSlots({ fix: true })
+  if (recon.mismatches) {
+    console.log(`[PARK] 预约库存对账完成：扫描 ${recon.checked} 个时段，修复 ${recon.fixed} 个计数漂移`)
+  }
+} catch (e) {
+  console.error('[PARK] 预约库存对账失败（不影响启动）：', e)
+}
+
 // 启动循环
 tick()
 setInterval(tick, TICK_MS)
@@ -821,15 +842,21 @@ app.post('/api/rides/:id', (req, res) => {
 
 app.delete('/api/rides/:id', (req, res) => {
   const id = num(req.params.id)
-  // 拆除前对在途预约按园方原因全额退款
+  // 拆除前对在途预约按园方原因全额退款（逐单事务，失败收集并阻止拆除，避免款项/库存不一致）
   const pending = db.prepare("SELECT * FROM reservations WHERE ride_id=? AND status='booked'").all(id)
+  const failures = []
   for (const r of pending) {
-    refundReservation(r, 'park', '设施拆除，园方强制退款')
+    const rr = refundReservation(r, 'park', '设施拆除，园方强制退款')
+    if (!rr.ok) failures.push({ id: r.id, code: rr.code, msg: rr.msg })
+  }
+  if (failures.length) {
+    throw new ApiError('RSV_STATE_CONFLICT',
+      `${failures.length} 单在途预约退款失败，设施未拆除，请稍后重试`, { details: { failures } })
   }
   // 在途检修工单作废
   cancelOrdersByRide(id)
   db.prepare('DELETE FROM rides WHERE id=?').run(id)
-  res.json({ ok: true })
+  res.json({ ok: true, refunded: pending.length })
 })
 
 // ---- 商铺 ----
@@ -1111,7 +1138,13 @@ app.get('/api/reservation-slots', (req, res) => {
 // 运营调度：调整时段容量 / 超售额度 / 开关时段
 app.post('/api/reservation-slots/:id', (req, res) => {
   const r = updateSlot(num(req.params.id), req.body || {})
+  if (!r.ok) throw new ApiError(r.code || 'RSV_INTERNAL', r.msg, { details: r.details })
   res.json(r)
+})
+
+// 库存对账：运营手动触发（只读健康检查 ?fix=0；默认修复漂移并留痕）
+app.get('/api/reservation-slots-reconcile', (req, res) => {
+  res.json({ ok: true, ...reconcileSlots({ fix: req.query?.fix !== '0' }) })
 })
 
 // 预约列表（可按状态/类型/日期过滤）
@@ -1127,8 +1160,8 @@ app.get('/api/reservations', (req, res) => {
   })
 })
 
-// 游客下单：按日期 + 时段预约入园或设施
-app.post('/api/reservations', (req, res) => {
+// 游客下单：按日期 + 时段预约入园或设施。携带 Idempotency-Key，双击/重试只生效一次
+app.post('/api/reservations', idempotent('reservation.book'), (req, res) => {
   const b = req.body || {}
   const scope = b.scope === 'ride' ? 'ride' : 'entry'
   const r = createReservation({
@@ -1140,30 +1173,40 @@ app.post('/api/reservations', (req, res) => {
     guest_phone: String(b.guest_phone || '').trim(),
     source: b.source === 'manual' ? 'manual' : 'guest'
   })
-  res.status(r.ok ? 200 : 400).json(r)
+  requireOk(r, '下单失败')
+  res.json(r)
 })
 
-// 改签：目标时段有余量才可改，库存原子转移
-app.post('/api/reservations/:id/reschedule', (req, res) => {
-  res.json(rescheduleReservation(num(req.params.id), num(req.body?.slot_id)))
+// 改签：目标时段有余量才可改，库存原子转移；同一幂等键重放首次结果
+app.post('/api/reservations/:id/reschedule', idempotent('reservation.reschedule'), (req, res) => {
+  const r = rescheduleReservation(num(req.params.id), num(req.body?.slot_id))
+  requireOk(r, '改签失败')
+  res.json(r)
 })
 
 // 取消：未开始全额退，当日取消退 50%，时段已过不可取消
-app.post('/api/reservations/:id/cancel', (req, res) => {
-  res.json(cancelReservation(num(req.params.id)))
+app.post('/api/reservations/:id/cancel', idempotent('reservation.cancel'), (req, res) => {
+  const r = cancelReservation(num(req.params.id))
+  requireOk(r, '取消失败')
+  res.json(r)
 })
 
-// 闸机 / 设施口扫码核销
-app.post('/api/reservations/:id/checkin', (req, res) => {
-  res.json(checkinReservation(num(req.params.id)))
+// 闸机 / 设施口扫码核销：重复扫码返回状态冲突，不会重复放行
+app.post('/api/reservations/:id/checkin', idempotent('reservation.checkin'), (req, res) => {
+  const r = checkinReservation(num(req.params.id))
+  requireOk(r, '核销失败')
+  res.json(r)
 })
 
 // 预约详情时间线
 app.get('/api/reservations/:id', (req, res) => {
   const id = num(req.params.id)
   const list = listReservations({ limit: 5000 }).filter(x => x.id === id)
-  if (!list.length) return res.status(404).json({ ok: false })
+  if (!list.length) throw new ApiError('RSV_NOT_FOUND', '预约不存在')
   res.json({ reservation: list[0], logs: reservationLogs(id) })
 })
+
+// 统一错误出口：所有业务失败/未捕获异常 → { ok:false, code, msg, hint, trace_id }
+app.use(errorHandler(console.error))
 
 app.listen(PORT, () => console.log(`[PARK] API running at http://localhost:${PORT}`))

@@ -3,7 +3,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const DB_PATH = join(__dirname, 'park.db')
+// 可用 PARK_DB_PATH 覆盖（测试传 ':memory:' 隔离真实库）
+const DB_PATH = process.env.PARK_DB_PATH || join(__dirname, 'park.db')
 
 const db = new DatabaseSync(DB_PATH)
 
@@ -199,6 +200,8 @@ CREATE TABLE IF NOT EXISTS reservations (
   reason TEXT NOT NULL DEFAULT '',      -- guest/late/park/overbook/noshow
   source TEXT NOT NULL DEFAULT 'guest', -- guest 游客端 / auto 模拟客流 / manual 前台
   reschedules INTEGER NOT NULL DEFAULT 0,
+  refund_amount INTEGER NOT NULL DEFAULT 0, -- 已退金额（退款留痕，幂等重放/对账用）
+  refund_fee INTEGER NOT NULL DEFAULT 0,    -- 退款手续费（当日取消扣 50%）
   created_tick INTEGER NOT NULL,
   created_day INTEGER NOT NULL,
   checked_tick INTEGER NOT NULL DEFAULT 0,
@@ -251,7 +254,47 @@ CREATE TABLE IF NOT EXISTS maintenance_logs (
   staff_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_maint_logs_oid ON maintenance_logs(order_id);
+
+-- 幂等请求键：同一 scope+key 的重复请求（双击/重试/网络重发）直接返回首次执行结果，不产生重复副作用
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,           -- create / cancel / reschedule / checkin
+  key TEXT NOT NULL,             -- 客户端请求号（UUID）
+  response TEXT NOT NULL,        -- 首次执行结果快照（JSON）
+  created_tick INTEGER NOT NULL DEFAULT 0,
+  created_day INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idem_scope_key ON idempotency_keys(scope,key);
 `)
+
+// ---------- 轻量列迁移（兼容老库） ----------
+function ensureColumn(table, col, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all()
+  if (!cols.some(c => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`)
+}
+// 退款金额/手续费留痕：幂等重放与财务对账
+ensureColumn('reservations', 'refund_amount', "refund_amount INTEGER NOT NULL DEFAULT 0")
+ensureColumn('reservations', 'refund_fee', "refund_fee INTEGER NOT NULL DEFAULT 0")
+
+// ---------- 事务 ----------
+// 多步写入（库存/订单/现金/流水/日志）必须原子提交：任一步失败整体回滚，不留半完成状态。
+// 嵌套调用并入外层事务（node:sqlite 单连接同步执行，靠深度计数避免嵌套 BEGIN 报错）。
+let txDepth = 0
+function tx(fn) {
+  if (txDepth > 0) return fn()
+  db.exec('BEGIN IMMEDIATE')
+  txDepth++
+  try {
+    const r = fn()
+    db.exec('COMMIT')
+    return r
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 连接已回滚时忽略 */ }
+    throw e
+  } finally {
+    txDepth--
+  }
+}
 
 const now = () => new Date().toISOString()
 
@@ -340,4 +383,4 @@ function seed() {
 seed()
 
 export default db
-export { now, getSetting, setSetting }
+export { now, getSetting, setSetting, tx }

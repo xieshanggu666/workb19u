@@ -17,6 +17,13 @@ import {
 const app = express()
 app.use(express.json())
 
+// 请求追踪：每个 API 请求分配请求号（响应头 X-Request-Id + 响应体 reqId），前端报错可凭此定位
+app.use((req, res, next) => {
+  req.reqId = 'R' + Date.now().toString(36).slice(-6) + Math.random().toString(36).slice(2, 6)
+  res.setHeader('X-Request-Id', req.reqId)
+  next()
+})
+
 const PORT = 4150
 const HOURS_PER_DAY = 10   // 9:00 ~ 18:00
 const OPEN_HOUR = 9
@@ -1095,6 +1102,11 @@ app.post('/api/maintenance/:id/cancel', (req, res) => {
 })
 
 // ---- 分时预约：库存 / 下单 / 改签 / 取消 / 核销 ----
+// 幂等键：body.request_id 优先，兼容 X-Idempotency-Key 头；同一键重复请求返回首次结果
+const idemKey = req => String(req.body?.request_id || req.get('X-Idempotency-Key') || '').slice(0, 80)
+// 统一响应：附带服务端请求号，前端可展示「错误码 · 请求号」便于追踪
+const reply = (req, res, r, okStatus = 200) => res.status(r?.ok ? okStatus : 400).json({ ...r, reqId: req.reqId })
+
 // 查询时段库存（入园 entry / 设施 ride），可按日期与设施过滤
 app.get('/api/reservation-slots', (req, res) => {
   const q = req.query || {}
@@ -1110,8 +1122,7 @@ app.get('/api/reservation-slots', (req, res) => {
 
 // 运营调度：调整时段容量 / 超售额度 / 开关时段
 app.post('/api/reservation-slots/:id', (req, res) => {
-  const r = updateSlot(num(req.params.id), req.body || {})
-  res.json(r)
+  reply(req, res, updateSlot(num(req.params.id), req.body || {}))
 })
 
 // 预约列表（可按状态/类型/日期过滤）
@@ -1127,7 +1138,7 @@ app.get('/api/reservations', (req, res) => {
   })
 })
 
-// 游客下单：按日期 + 时段预约入园或设施
+// 游客下单：按日期 + 时段预约入园或设施（幂等：request_id 防重复提交）
 app.post('/api/reservations', (req, res) => {
   const b = req.body || {}
   const scope = b.scope === 'ride' ? 'ride' : 'entry'
@@ -1138,24 +1149,25 @@ app.post('/api/reservations', (req, res) => {
     qty: num(b.qty, 1),
     guest_name: String(b.guest_name || '').trim(),
     guest_phone: String(b.guest_phone || '').trim(),
-    source: b.source === 'manual' ? 'manual' : 'guest'
+    source: b.source === 'manual' ? 'manual' : 'guest',
+    requestId: idemKey(req)
   })
-  res.status(r.ok ? 200 : 400).json(r)
+  reply(req, res, r)
 })
 
-// 改签：目标时段有余量才可改，库存原子转移
+// 改签：目标时段有余量才可改，库存原子转移（幂等：重放不产生二次转移）
 app.post('/api/reservations/:id/reschedule', (req, res) => {
-  res.json(rescheduleReservation(num(req.params.id), num(req.body?.slot_id)))
+  reply(req, res, rescheduleReservation(num(req.params.id), num(req.body?.slot_id), idemKey(req)))
 })
 
-// 取消：未开始全额退，当日取消退 50%，时段已过不可取消
+// 取消：未开始全额退，当日取消退 50%，时段已过不可取消（幂等：重放不重复退款）
 app.post('/api/reservations/:id/cancel', (req, res) => {
-  res.json(cancelReservation(num(req.params.id)))
+  reply(req, res, cancelReservation(num(req.params.id), idemKey(req)))
 })
 
-// 闸机 / 设施口扫码核销
+// 闸机 / 设施口扫码核销（幂等：重复扫码不重复放行）
 app.post('/api/reservations/:id/checkin', (req, res) => {
-  res.json(checkinReservation(num(req.params.id)))
+  reply(req, res, checkinReservation(num(req.params.id), idemKey(req)))
 })
 
 // 预约详情时间线
@@ -1164,6 +1176,12 @@ app.get('/api/reservations/:id', (req, res) => {
   const list = listReservations({ limit: 5000 }).filter(x => x.id === id)
   if (!list.length) return res.status(404).json({ ok: false })
   res.json({ reservation: list[0], logs: reservationLogs(id) })
+})
+
+// 全局异常兜底：未捕获错误统一返回可追踪的 500（请求号写入服务端日志）
+app.use((err, req, res, _next) => {
+  console.error(`[api] 请求 ${req.reqId || '-'} ${req.method} ${req.path} 处理异常:`, err)
+  res.status(500).json({ ok: false, code: 'INTERNAL', msg: '服务器内部错误，操作未生效，请稍后重试', reqId: req.reqId })
 })
 
 app.listen(PORT, () => console.log(`[PARK] API running at http://localhost:${PORT}`))

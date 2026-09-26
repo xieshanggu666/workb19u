@@ -2,11 +2,24 @@ import { defineStore } from 'pinia'
 
 const BASE = '/api'
 
+// 生成幂等请求号：同一意图的双击/重试携带同一 requestId，服务端只执行一次
+export function newRequestId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID()
+  return 'req-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
+}
+
 async function j(method, path, body) {
   const opt = { method, headers: { 'Content-Type': 'application/json' } }
   if (body) opt.body = JSON.stringify(body)
-  const r = await fetch(BASE + path, opt)
-  return r.json()
+  try {
+    const r = await fetch(BASE + path, opt)
+    const data = await r.json().catch(() => null)
+    if (!data) return { ok: false, code: 'BAD_RESPONSE', msg: `服务响应异常（HTTP ${r.status}），请稍后重试` }
+    return data
+  } catch (e) {
+    // 网络中断/超时：请求可能未送达或已送达，提示用户勿盲目重复提交（携带幂等键的操作可安全重试）
+    return { ok: false, code: 'NETWORK', msg: '网络异常，请求未送达，请检查连接后重试' }
+  }
 }
 
 function emptyReservationStats() {
@@ -26,6 +39,7 @@ export const useParkStore = defineStore('park', {
   }),
   getters: {
     clock: s => s.data?.clock || { day: 1, hour: 9 },
+    ticket: s => s.data?.ticket ?? 0,
     zones: s => s.data?.zones || [],
     rides: s => s.data?.rides || [],
     vendors: s => s.data?.vendors || [],
@@ -79,11 +93,11 @@ export const useParkStore = defineStore('park', {
     resolveComplaint(id, compensation) { return this.api('POST', `/complaints/${id}/resolve`, { compensation }) },
     closeComplaint(id) { return this.api('POST', `/complaints/${id}/close`, {}) },
     async complaintDetail(id) { return j('GET', `/complaints/${id}`) },
-    // 分时预约
+    // 分时预约（写操作携带 request_id 幂等键，重放返回首次结果不产生重复副作用）
     bookReservation(payload) { return this.api('POST', '/reservations', payload) },
-    rescheduleReservation(id, slot_id) { return this.api('POST', `/reservations/${id}/reschedule`, { slot_id }) },
-    cancelReservation(id) { return this.api('POST', `/reservations/${id}/cancel`, {}) },
-    checkinReservation(id) { return this.api('POST', `/reservations/${id}/checkin`, {}) },
+    rescheduleReservation(id, slot_id, request_id) { return this.api('POST', `/reservations/${id}/reschedule`, { slot_id, request_id }) },
+    cancelReservation(id, request_id) { return this.api('POST', `/reservations/${id}/cancel`, { request_id }) },
+    checkinReservation(id, request_id) { return this.api('POST', `/reservations/${id}/checkin`, { request_id }) },
     updateSlot(id, payload) { return this.api('POST', `/reservation-slots/${id}`, payload) },
     async rideSlots(rideId, day) { return j('GET', `/reservation-slots?scope=ride&rideId=${rideId}${day ? `&day=${day}` : ''}`) },
     async reservationDetail(id) { return j('GET', `/reservations/${id}`) },

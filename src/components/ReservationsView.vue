@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { useParkStore } from '@/store/park'
+import { useParkStore, newRequestId } from '@/store/park'
 
 const store = useParkStore()
 onMounted(async () => {
@@ -12,6 +12,14 @@ watch(() => store.clock.tick, () => { if (tab.value === 'guest' || tab.value ===
 
 const today = computed(() => store.clock.day)
 const stats = computed(() => store.reservationStats)
+
+// 后端错误转「中文提示〔错误码 · 请求号〕」：请求号可在服务端日志定位，超时/中断也有码可追踪
+function errText(r, fallback = '操作失败，请稍后重试') {
+  if (r?.ok) return ''
+  const msg = r?.msg || fallback
+  const tag = r?.code ? `〔${r.code}${r.reqId ? ' · ' + r.reqId : ''}〕` : ''
+  return msg + tag
+}
 
 // ---- 三个页签 ----
 const tabs = [
@@ -28,7 +36,13 @@ const pickDay = computed(() => today.value + dayOffset.value)
 const dayOffset = ref(0)
 const qty = ref(2)
 const guestName = ref('')
-const bookMsg = ref('')
+const bookMsg = ref(null)          // { text, ok }
+const booking = ref(false)         // 提交中：禁用按钮防双击
+const selectedSlot = ref(null)
+// 当前下单意图的幂等键：同一意图的重试/双击复用；意图变化或下单成功后换新键
+const bookReqId = ref(newRequestId())
+// 表单意图一变（时段/日期/类型/设施/人数），旧请求号作废，避免误命中上一次提交结果
+watch([scope, pickRide, dayOffset, selectedSlot, qty], () => { bookReqId.value = newRequestId() })
 
 const rideSlotsMap = ref({})   // rideId -> slots
 const rideSlotsLoading = ref(false)
@@ -62,7 +76,6 @@ const unitPrice = computed(() => scope.value === 'entry' ? +store.ticket : (chos
 const totalPrice = computed(() => unitPrice.value * qty.value)
 
 function pickSlot(s) { selectedSlot.value = s }
-const selectedSlot = ref(null)
 function onScopeChange() { selectedSlot.value = null; if (scope.value === 'ride' && !pickRide.value && store.rides.length) pickRide.value = store.rides.find(r => r.status === 'operating')?.id || 0 }
 function onRideChange() { selectedSlot.value = null }
 
@@ -75,22 +88,30 @@ function slotState(s) {
 }
 
 async function submitBook() {
-  bookMsg.value = ''
-  if (!selectedSlot.value) { bookMsg.value = '请选择入园/游玩时段'; return }
-  const r = await store.bookReservation({
-    scope: scope.value,
-    ride_id: scope.value === 'ride' ? pickRide.value : undefined,
-    slot_id: selectedSlot.value.id,
-    qty: qty.value,
-    guest_name: guestName.value
-  })
-  if (r?.ok) {
-    bookMsg.value = `预约成功！预约号 ${r.code}，预收 ¥${totalPrice.value.toLocaleString()}，请按时段核销入园`
-    guestName.value = ''
-    selectedSlot.value = null
-    if (scope.value === 'ride') await loadRideSlots()
-  } else {
-    bookMsg.value = r?.msg || '预约失败'
+  bookMsg.value = null
+  if (booking.value) return                       // 双击防护：同一意图只提交一次
+  if (!selectedSlot.value) { bookMsg.value = { text: '请选择入园/游玩时段', ok: false }; return }
+  booking.value = true
+  try {
+    const r = await store.bookReservation({
+      scope: scope.value,
+      ride_id: scope.value === 'ride' ? pickRide.value : undefined,
+      slot_id: selectedSlot.value.id,
+      qty: qty.value,
+      guest_name: guestName.value,
+      request_id: bookReqId.value                 // 幂等键：重试/双击不会重复下单扣款
+    })
+    if (r?.ok) {
+      bookMsg.value = { text: `预约成功！预约号 ${r.code}，预收 ¥${totalPrice.value.toLocaleString()}，请按时段核销入园`, ok: true }
+      guestName.value = ''
+      selectedSlot.value = null
+      bookReqId.value = newRequestId()            // 成功后换新键，下一次提交是新意图
+      if (scope.value === 'ride') await loadRideSlots()
+    } else {
+      bookMsg.value = { text: errText(r, '预约失败'), ok: false }
+    }
+  } finally {
+    booking.value = false
   }
 }
 
@@ -136,13 +157,25 @@ const statusBadge = st => ({
   refunded_half: { cls: 'b-half', text: '退50%' }
 }[st] || { cls: '', text: st })
 
+// 行级操作防重：同一单据的核销/取消/改签进行中禁用按钮，并携带幂等键
+const rowBusy = ref({})
+async function rowOp(r, fn) {
+  if (rowBusy.value[r.id]) return
+  rowBusy.value[r.id] = true
+  try { await fn() } finally { rowBusy.value[r.id] = false }
+}
+
 async function checkin(r) {
-  const res = await store.checkinReservation(r.id)
-  flash(r.id, res?.ok ? `✓ ${r.code} 已核销 ${r.qty} 人` : (res?.msg || '核销失败'), res?.ok)
+  await rowOp(r, async () => {
+    const res = await store.checkinReservation(r.id, newRequestId())
+    flash(r.id, res?.ok ? `✓ ${r.code} 已核销 ${r.qty} 人` : errText(res, '核销失败'), res?.ok)
+  })
 }
 async function cancel(r) {
-  const res = await store.cancelReservation(r.id)
-  flash(r.id, res?.ok ? `已取消，退款 ¥${res.back}${res.fee ? `，手续费 ¥${res.fee}` : ''}` : (res?.msg || '取消失败'), res?.ok)
+  await rowOp(r, async () => {
+    const res = await store.cancelReservation(r.id, newRequestId())
+    flash(r.id, res?.ok ? `已取消，退款 ¥${res.back}${res.fee ? `，手续费 ¥${res.fee}` : ''}` : errText(res, '取消失败'), res?.ok)
+  })
 }
 
 // 改签：展开选择其他时段
@@ -164,9 +197,11 @@ const rsCandidates = (r) => {
 async function doReschedule(r) {
   const sid = +rsTarget.value[r.id]
   if (!sid) return
-  const res = await store.rescheduleReservation(r.id, sid)
-  flash(r.id, res?.ok ? '改签成功' : (res?.msg || '改签失败'), res?.ok)
-  if (res?.ok) { rsOpen.value[r.id] = false; await loadRideSlots() }
+  await rowOp(r, async () => {
+    const res = await store.rescheduleReservation(r.id, sid, newRequestId())
+    flash(r.id, res?.ok ? '改签成功' : errText(res, '改签失败'), res?.ok)
+    if (res?.ok) { rsOpen.value[r.id] = false; await loadRideSlots() }
+  })
 }
 
 const flashes = ref({})
@@ -251,10 +286,10 @@ function pickDayIf(off) { return today.value + off }
           <span>合计预收 <b class="money">¥{{ totalPrice.toLocaleString() }}</b></span>
           <em class="muted">提前取消全额退；当日取消退 50%；爽约不退。预约费用下单即收取。</em>
         </div>
-        <button class="primary wide" :disabled="!selectedSlot" @click="submitBook">
-          {{ selectedSlot ? `预约 第${selectedSlot.day}天 ${selectedSlot.hour}:00 · ¥${totalPrice.toLocaleString()}` : '请先选择时段' }}
+        <button class="primary wide" :disabled="!selectedSlot || booking" @click="submitBook">
+          {{ booking ? '提交中…' : selectedSlot ? `预约 第${selectedSlot.day}天 ${selectedSlot.hour}:00 · ¥${totalPrice.toLocaleString()}` : '请先选择时段' }}
         </button>
-        <em v-if="bookMsg" class="bookmsg" :class="{ err: bookMsg.includes('失败') || bookMsg.includes('请') }">{{ bookMsg }}</em>
+        <em v-if="bookMsg" class="bookmsg" :class="{ err: !bookMsg.ok }">{{ bookMsg.text }}</em>
       </div>
 
       <div class="card slots-card">
@@ -366,9 +401,9 @@ function pickDayIf(off) { return today.value + off }
           </div>
           <div class="ti-ops">
             <template v-if="r.status === 'booked'">
-              <button class="succ" @click="checkin(r)">✅ 核销</button>
-              <button class="ghost" @click="toggleRs(r.id)">改签</button>
-              <button class="danger" @click="cancel(r)">取消退款</button>
+              <button class="succ" :disabled="rowBusy[r.id]" @click="checkin(r)">✅ 核销</button>
+              <button class="ghost" :disabled="rowBusy[r.id]" @click="toggleRs(r.id)">改签</button>
+              <button class="danger" :disabled="rowBusy[r.id]" @click="cancel(r)">取消退款</button>
             </template>
             <button class="ghost" @click="openDetail(r)">时间线</button>
           </div>
@@ -380,7 +415,7 @@ function pickDayIf(off) { return today.value + off }
                 第{{ s.day }}天 {{ s.hour }}:00 · 余 {{ s.remain }}{{ s.scope === 'ride' ? ` · ${s.ride_name}` : '' }}
               </option>
             </select>
-            <button class="primary" :disabled="!rsTarget[r.id]" @click="doReschedule(r)">确认改签（不加价）</button>
+            <button class="primary" :disabled="!rsTarget[r.id] || rowBusy[r.id]" @click="doReschedule(r)">确认改签（不加价）</button>
           </div>
           <em v-if="flashes[r.id]" class="flash" :class="{ ok: flashes[r.id].ok, err: !flashes[r.id].ok }">{{ flashes[r.id].msg }}</em>
         </div>

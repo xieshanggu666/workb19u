@@ -1,4 +1,4 @@
-import db, { getSetting, setSetting } from './db.js'
+import db, { getSetting, setSetting, tx } from './db.js'
 
 // 分时预约模块：入园时段 9:00~18:00；设施时段 9:00~17:00（末班需留出运行时间）
 const OPEN_HOUR = 9
@@ -10,6 +10,62 @@ const DEFAULT_ENTRY_OVERSELL = 20 // 入园默认 5% 超售额度对冲爽约
 const GENERATE_DAYS = 3           // 始终维护今/明/后三天的库存
 const CHECKIN_RATE = 0.82         // 模拟客流的自然核销（到场）概率
 const LATE_CANCEL_FEE = 0.5       // 当日取消保留 50% 手续费
+
+// ---------------- 业务错误码（前端可追踪：code + reqId 定位问题） ----------------
+export const RSV_ERR = {
+  NOT_FOUND: 'RSV_NOT_FOUND',              // 预约不存在
+  STATUS_CONFLICT: 'RSV_STATUS_CONFLICT',  // 状态已变化（重复操作/并发冲突），需刷新
+  SLOT_NOT_FOUND: 'SLOT_NOT_FOUND',
+  SLOT_CLOSED: 'SLOT_CLOSED',
+  SLOT_FULL: 'SLOT_FULL',
+  SLOT_PAST: 'SLOT_PAST',
+  SLOT_MISMATCH: 'SLOT_MISMATCH',
+  RIDE_UNAVAILABLE: 'RIDE_UNAVAILABLE',
+  RESCHED_SAME: 'RESCHED_SAME_SLOT',
+  CHECKIN_EARLY: 'CHECKIN_TOO_EARLY',
+  CHECKIN_LATE: 'CHECKIN_TOO_LATE',
+  OVERBOOK_MOVED: 'OVERBOOK_AUTO_RESCHEDULED', // 超售已自动改签（业务提示，非系统故障）
+  OVERBOOK_REFUNDED: 'OVERBOOK_REFUNDED',      // 超售无法安置已全额退款（业务提示）
+  TX_FAILED: 'TX_FAILED'                       // 事务异常已回滚
+}
+
+const fail = (code, msg, extra = {}) => ({ ok: false, code, msg, ...extra })
+
+// 事务内抛出的业务错误：触发整体回滚，由 runAtomic 转换为可追踪的失败响应
+class TxError extends Error {
+  constructor(code, msg, extra = {}) { super(msg); this.code = code; this.extra = extra }
+}
+
+// 原子执行：fn 内所有写入同事务，TxError/异常 → 回滚并返回失败响应（系统异常不缓存，允许重试）
+function runAtomic(fn) {
+  try {
+    return tx(fn)
+  } catch (e) {
+    if (e instanceof TxError) return fail(e.code, e.message, e.extra)
+    console.error('[reservations] 事务执行失败，已整体回滚:', e)
+    return fail(RSV_ERR.TX_FAILED, '系统繁忙，本次操作未生效，请稍后重试')
+  }
+}
+
+// 幂等执行：同一 scope+requestId 的重复请求直接返回首次结果（replay 标记），不产生重复副作用。
+// 业务结果（含业务失败）都缓存，保证重试响应一致；系统异常（TX_FAILED，已回滚无副作用）不缓存，允许同键安全重试。
+function idempotent(scope, requestId, fn) {
+  const key = String(requestId || '').trim().slice(0, 80)
+  if (!key) return fn()
+  const hit = db.prepare('SELECT response FROM idempotency_keys WHERE scope=? AND key=?').get(scope, key)
+  if (hit) return { ...JSON.parse(hit.response), replay: true }
+  const result = fn()
+  if (result?.code !== RSV_ERR.TX_FAILED) {
+    db.prepare('INSERT OR IGNORE INTO idempotency_keys(scope,key,response,created_tick,created_day) VALUES(?,?,?,?,?)')
+      .run(scope, key, JSON.stringify(result), ctx.tick(), ctx.day())
+  }
+  return result
+}
+
+// 清理过期幂等键（保留最近 3 个游戏日，随 ensureSlots 每小时调用）
+function cleanupIdempotencyKeys() {
+  db.prepare('DELETE FROM idempotency_keys WHERE created_day < ?').run(ctx.day() - 2)
+}
 
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 
@@ -50,6 +106,7 @@ function ridePrice(r) { return r?.price ?? 30 }
 // ---------------- 库存生成与同步 ----------------
 // 确保未来 GENERATE_DAYS 天的入园 / 设施时段库存存在（幂等）
 export function ensureSlots() {
+  cleanupIdempotencyKeys()
   const today = ctx.day()
   const rideIds = db.prepare('SELECT id,status FROM rides').all()
   const insertEntry = db.prepare(`INSERT OR IGNORE INTO reservation_slots(scope,ride_id,day,hour,capacity,oversell)
@@ -68,22 +125,26 @@ export function ensureSlots() {
 }
 
 // 设备状态变化时联动未来时段：停运则关闭时段并强制退款在途预约；恢复则重新开放
+// 关时段 + 批量退款 + 投诉在同一事务内提交，任一步失败整体回滚（不会时段关了款没退）
 export function syncRideSlots(ride) {
   if (!ride) return
-  if (ride.status === 'operating') {
-    db.prepare(`UPDATE reservation_slots SET status='open' WHERE scope='ride' AND ride_id=? AND day>=?`)
-      .run(ride.id, ctx.day())
-    return
-  }
-  // 关闭/检修：关停全部时段（含历史，恢复运营时再统一开放）；在途预约园方全额退款
-  db.prepare(`UPDATE reservation_slots SET status='closed' WHERE scope='ride' AND ride_id=?`)
-    .run(ride.id)
-  forceRefundByPark(
-    db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
-                AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour()),
-    `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
-    { title: `设施故障 · ${ride.name}` }
-  )
+  return runAtomic(() => {
+    if (ride.status === 'operating') {
+      db.prepare(`UPDATE reservation_slots SET status='open' WHERE scope='ride' AND ride_id=? AND day>=?`)
+        .run(ride.id, ctx.day())
+      return { ok: true }
+    }
+    // 关闭/检修：关停全部时段（含历史，恢复运营时再统一开放）；在途预约园方全额退款
+    db.prepare(`UPDATE reservation_slots SET status='closed' WHERE scope='ride' AND ride_id=?`)
+      .run(ride.id)
+    forceRefundByPark(
+      db.prepare(`SELECT * FROM reservations WHERE scope='ride' AND ride_id=? AND status='booked'
+                  AND (slot_day>? OR (slot_day=? AND slot_hour>=?))`).all(ride.id, ctx.day(), ctx.day(), ctx.hour()),
+      `关联设施「${ride.name}」${ride.status === 'maintenance' ? '检修' : '关闭'}，园方强制退款`,
+      { title: `设施故障 · ${ride.name}` }
+    )
+    return { ok: true }
+  })
 }
 
 // 园方原因强制全额退款（设备停运 / 超售无法改签）：款全额退回，生成投诉工单
@@ -108,182 +169,247 @@ function forceRefundByPark(rows, note, complaintInfo = {}) {
 }
 
 // ---------------- 下单 / 改签 / 退款 ----------------
-// 核心一致性：库存增减与预约单状态在同一同步流程内完成；node:sqlite 同步执行天然串行
+// 核心一致性：建单+扣库存+预收款+流水+日志在同一事务提交；库存用条件更新原子扣减，
+// 容量不足/时段关闭时条件更新命中 0 行 → 抛 TxError 整体回滚，不留半完成状态
 function bookSlot(slot, { guest_name, guest_phone, qty, amount, scope, rideId, source }) {
-  if (slot.status !== 'open') return { ok: false, msg: '该时段已关闭预约' }
-  if (slot.remain < qty) {
-    return { ok: false, msg: `该时段余量不足，仅剩 ${slot.remain} 个名额${slot.oversell > 0 ? `（含 ${slot.oversell} 超售额度）` : ''}` }
-  }
-  const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,created_tick,created_day)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?)`)
-    .run('', guest_name || '游客', guest_phone || '', scope, rideId, slot.id, slot.day, slot.hour,
-         qty, amount, source || 'guest', ctx.tick(), ctx.day())
-  const id = Number(result.lastInsertRowid)
-  const code = 'YY' + String(id).padStart(4, '0')
-  db.prepare('UPDATE reservations SET code=? WHERE id=?').run(code, id)
-  db.prepare('UPDATE reservation_slots SET booked_count=booked_count+? WHERE id=?').run(qty, slot.id)
-  // 预收款即时入账（现金制：下单即确认收入，核销不重复收费）
-  setSetting('cash', Math.round(ctx.cash() + amount))
-  ctx.logFinance?.(ctx.day(), scope === 'entry' ? '门票' : '游乐', amount,
-    `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人`)
-  logReservation(id, source === 'auto' ? 'auto_book' : 'create',
-    `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}`)
-  return { ok: true, id, code }
+  return runAtomic(() => {
+    // 库存原子校验+扣减：仅当时段开放且余量（容量+超售额度）充足才占用
+    const claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
+                              WHERE id=? AND status='open' AND capacity+oversell-booked_count>=?`)
+      .run(qty, slot.id, qty)
+    if (claim.changes === 0) {
+      const cur = getSlot(slot.id)
+      if (!cur || cur.status !== 'open') throw new TxError(RSV_ERR.SLOT_CLOSED, '该时段已关闭预约')
+      throw new TxError(RSV_ERR.SLOT_FULL,
+        `该时段余量不足，仅剩 ${Math.max(0, cur.remain)} 个名额${cur.oversell > 0 ? `（含 ${cur.oversell} 超售额度）` : ''}`)
+    }
+    const result = db.prepare(`INSERT INTO reservations(code,guest_name,guest_phone,scope,ride_id,slot_id,slot_day,slot_hour,qty,amount,status,source,created_tick,created_day)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,'booked',?,?,?)`)
+      .run('', guest_name || '游客', guest_phone || '', scope, rideId, slot.id, slot.day, slot.hour,
+           qty, amount, source || 'guest', ctx.tick(), ctx.day())
+    const id = Number(result.lastInsertRowid)
+    const code = 'YY' + String(id).padStart(4, '0')
+    db.prepare('UPDATE reservations SET code=? WHERE id=?').run(code, id)
+    // 预收款即时入账（现金制：下单即确认收入，核销不重复收费）
+    setSetting('cash', Math.round(ctx.cash() + amount))
+    ctx.logFinance?.(ctx.day(), scope === 'entry' ? '门票' : '游乐', amount,
+      `预约预收 ${code} · ${slot.day}日${slot.hour}:00 ${scope === 'entry' ? '入园' : '设施'} · ${qty} 人`)
+    logReservation(id, source === 'auto' ? 'auto_book' : 'create',
+      `${scope === 'entry' ? '入园' : '设施'}预约 ${slot.day}日 ${slot.hour}:00 · ${qty} 人 · 预收 ¥${amount}`)
+    return { ok: true, id, code }
+  })
 }
 
 // 统一退款：reason=park/overbook 全额；late 半价（另半价转为爽约手续费）；cascade 表示内部调用
+// 事务内：状态条件更新（仅 booked 可退，防重复退款）→ 退现金/记流水 → 释放库存，全部原子提交
 export function refundReservation(rsvOrId, reason = 'guest', note = '', opts = {}) {
   const rsv = typeof rsvOrId === 'object' ? rsvOrId : getReservation(rsvOrId)
-  if (!rsv) return { ok: false, msg: '预约不存在' }
-  if (!['booked'].includes(rsv.status)) return { ok: false, msg: '当前状态不可退款' }
+  if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+  if (rsv.status !== 'booked') {
+    // 已退款单重复退款：直接返回首次退款结果（幂等，不重复扣现金）
+    if (['refunded', 'refunded_half'].includes(rsv.status) && (rsv.refund_amount > 0 || rsv.refund_fee > 0)) {
+      return { ok: true, back: rsv.refund_amount, fee: rsv.refund_fee, dup: true }
+    }
+    return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可退款')
+  }
   const half = reason === 'late'
   const back = half ? Math.round(rsv.amount * (1 - LATE_CANCEL_FEE)) : rsv.amount
   const fee = rsv.amount - back
 
-  if (back > 0) {
-    const cash = ctx.cash() - back
-    setSetting('cash', Math.round(cash))
-    const label = rsv.scope === 'entry' ? '门票' : '游乐'
-    ctx.logFinance?.(ctx.day(), label, -back, `预约退款 ${rsv.code}${half ? '（当日取消扣 50% 手续费）' : ''}`)
-  }
-  if (fee > 0) ctx.logFinance?.(ctx.day(), '违约', fee, `预约 ${rsv.code} 取消费/爽约没收`)
+  const result = runAtomic(() => {
+    // 条件更新：仅 booked → 退款态，并发/重复调用时命中 0 行则回滚
+    const u = db.prepare(`UPDATE reservations SET status=?, reason=?, closed_tick=?, closed_day=?, refund_amount=?, refund_fee=?
+                          WHERE id=? AND status='booked'`)
+      .run(half ? 'refunded_half' : 'refunded', reason, ctx.tick(), ctx.day(), back, fee, rsv.id)
+    if (u.changes === 0) throw new TxError(RSV_ERR.STATUS_CONFLICT, '该预约状态已变更，退款未执行，请刷新后重试')
 
-  db.prepare(`UPDATE reservations SET status=?, reason=?, closed_tick=?, closed_day=? WHERE id=?`)
-    .run(half ? 'refunded_half' : 'refunded', reason, ctx.tick(), ctx.day(), rsv.id)
-  // 退款/取消释放可售名额；refund_count 单独留痕，核销容量不回补
-  db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?), refund_count=refund_count+? WHERE id=?')
-    .run(rsv.qty, rsv.qty, rsv.slot_id)
-  logReservation(rsv.id, half ? 'cancel' : 'refund',
-    `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}`)
+    if (back > 0) {
+      setSetting('cash', Math.round(ctx.cash() - back))
+      const label = rsv.scope === 'entry' ? '门票' : '游乐'
+      ctx.logFinance?.(ctx.day(), label, -back, `预约退款 ${rsv.code}${half ? '（当日取消扣 50% 手续费）' : ''}`)
+    }
+    if (fee > 0) ctx.logFinance?.(ctx.day(), '违约', fee, `预约 ${rsv.code} 取消费/爽约没收`)
 
-  if (!opts.skipComplaint && reason === 'overbook' && ctx.createComplaint) {
-    const ride = rsv.ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rsv.ride_id) : null
-    ctx.createComplaint({
-      category: rsv.scope === 'entry' ? 'queue' : 'facility',
-      severity: 2,
-      title: `超售补偿 · ${ride?.name || '分时入园'}`,
-      content: `预约 ${rsv.code} 到场时名额已满（超售无法改签），已全额退款 ¥${back}，游客不满要求补偿。`,
-      target: ride ? { type: 'ride', id: ride.id, name: ride.name } : { type: '', id: null, name: '' },
-      source: 'guest'
-    })
-  }
-  return { ok: true, back, fee }
+    // 退款/取消释放可售名额；refund_count 单独留痕，核销容量不回补
+    db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?), refund_count=refund_count+? WHERE id=?')
+      .run(rsv.qty, rsv.qty, rsv.slot_id)
+    logReservation(rsv.id, half ? 'cancel' : 'refund',
+      `${note || '退款'}：退回 ¥${back}${fee ? `，手续费 ¥${fee}` : ''}`)
+
+    if (!opts.skipComplaint && reason === 'overbook' && ctx.createComplaint) {
+      const ride = rsv.ride_id ? db.prepare('SELECT * FROM rides WHERE id=?').get(rsv.ride_id) : null
+      ctx.createComplaint({
+        category: rsv.scope === 'entry' ? 'queue' : 'facility',
+        severity: 2,
+        title: `超售补偿 · ${ride?.name || '分时入园'}`,
+        content: `预约 ${rsv.code} 到场时名额已满（超售无法改签），已全额退款 ¥${back}，游客不满要求补偿。`,
+        target: ride ? { type: 'ride', id: ride.id, name: ride.name } : { type: '', id: null, name: '' },
+        source: 'guest'
+      })
+    }
+    return { ok: true, back, fee }
+  })
+  return result
 }
 
 // 游客取消：未来时段全额退；当日取消扣 50%；时段已过不允许（走爽约流程）
-export function cancelReservation(id) {
-  const rsv = getReservation(id)
-  if (!rsv) return { ok: false, msg: '预约不存在' }
-  if (rsv.status !== 'booked') return { ok: false, msg: '当前状态不可取消' }
-  if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour <= ctx.hour())) {
-    return { ok: false, msg: '入园时段已开始/结束，不可取消；未到场将按爽约处理' }
-  }
-  const late = rsv.slot_day === ctx.day()
-  return refundReservation(rsv, late ? 'late' : 'guest', late ? '游客当日取消' : '游客提前取消')
+// requestId 幂等：同一请求重放返回首次退款结果，不重复扣现金
+export function cancelReservation(id, requestId = '') {
+  return idempotent('cancel', requestId, () => {
+    const rsv = getReservation(id)
+    if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可取消（可能已核销/退款/爽约）')
+    if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour <= ctx.hour())) {
+      return fail(RSV_ERR.SLOT_PAST, '入园时段已开始/结束，不可取消；未到场将按爽约处理')
+    }
+    const late = rsv.slot_day === ctx.day()
+    return refundReservation(rsv, late ? 'late' : 'guest', late ? '游客当日取消' : '游客提前取消')
+  })
 }
 
-// 改签：目标时段有余量才可改；库存原子转移（原 slot 减 booked，新 slot 加 booked）
-export function rescheduleReservation(id, targetSlotId) {
-  const rsv = getReservation(id)
-  if (!rsv) return { ok: false, msg: '预约不存在' }
-  if (rsv.status !== 'booked') return { ok: false, msg: '当前状态不可改签' }
-  if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour < ctx.hour())) {
-    return { ok: false, msg: '原时段已过期，不可改签' }
-  }
-  const target = getSlot(num(targetSlotId))
-  if (!target || target.scope !== rsv.scope || (rsv.scope === 'ride' && target.ride_id !== rsv.ride_id)) {
-    return { ok: false, msg: '改签目标时段无效' }
-  }
-  if (target.status !== 'open') return { ok: false, msg: '目标时段已关闭预约' }
-  if (target.id === rsv.slot_id) return { ok: false, msg: '目标时段与原时段相同' }
-  if (target.remain < rsv.qty) return { ok: false, msg: `目标时段余量不足（剩 ${target.remain}）` }
+// 改签：目标时段有余量才可改；目标原子占用 → 预约单条件更新 → 原时段释放，全部在同一事务
+// requestId 幂等：同一改签请求重放不产生二次库存转移
+export function rescheduleReservation(id, targetSlotId, requestId = '') {
+  return idempotent('reschedule', requestId, () => {
+    const rsv = getReservation(id)
+    if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可改签')
+    if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour < ctx.hour())) {
+      return fail(RSV_ERR.SLOT_PAST, '原时段已过期，不可改签')
+    }
+    const target = getSlot(num(targetSlotId))
+    if (!target || target.scope !== rsv.scope || (rsv.scope === 'ride' && target.ride_id !== rsv.ride_id)) {
+      return fail(RSV_ERR.SLOT_MISMATCH, '改签目标时段无效')
+    }
+    if (target.status !== 'open') return fail(RSV_ERR.SLOT_CLOSED, '目标时段已关闭预约')
+    if (target.id === rsv.slot_id) return fail(RSV_ERR.RESCHED_SAME, '目标时段与原时段相同')
+    if (target.remain < rsv.qty) return fail(RSV_ERR.SLOT_FULL, `目标时段余量不足（剩 ${target.remain}）`)
 
-  db.prepare('UPDATE reservation_slots SET booked_count=booked_count-? WHERE id=?').run(rsv.qty, rsv.slot_id)
-  db.prepare('UPDATE reservation_slots SET booked_count=booked_count+? WHERE id=?').run(rsv.qty, target.id)
-  const n = rsv.reschedules + 1
-  db.prepare(`UPDATE reservations SET slot_id=?, slot_day=?, slot_hour=?, reschedules=? WHERE id=?`)
-    .run(target.id, target.day, target.hour, n, id)
-  logReservation(id, 'reschedule',
-    `改签为 ${target.day}日 ${target.hour}:00（第 ${n} 次改签）`)
-  return { ok: true }
+    return runAtomic(() => {
+      // 1) 目标时段原子占用（开放且余量充足才命中）
+      const claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
+                                WHERE id=? AND status='open' AND capacity+oversell-booked_count>=?`)
+        .run(rsv.qty, target.id, rsv.qty)
+      if (claim.changes === 0) {
+        const cur = getSlot(target.id)
+        if (!cur || cur.status !== 'open') throw new TxError(RSV_ERR.SLOT_CLOSED, '目标时段已关闭预约')
+        throw new TxError(RSV_ERR.SLOT_FULL, `目标时段余量不足（剩 ${Math.max(0, cur.remain)}）`)
+      }
+      // 2) 预约单条件更新：仅 booked 且仍挂原时段才成功，防止并发/重复改签
+      const u = db.prepare(`UPDATE reservations SET slot_id=?, slot_day=?, slot_hour=?, reschedules=?
+                            WHERE id=? AND status='booked' AND slot_id=?`)
+        .run(target.id, target.day, target.hour, rsv.reschedules + 1, id, rsv.slot_id)
+      if (u.changes === 0) throw new TxError(RSV_ERR.STATUS_CONFLICT, '该预约状态已变更，改签未执行，请刷新后重试')
+      // 3) 原时段释放（走到这里前两步已成功；任一步抛错整体回滚，库存不会凭空蒸发或重复占用）
+      db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?) WHERE id=?').run(rsv.qty, rsv.slot_id)
+      logReservation(id, 'reschedule', `改签为 ${target.day}日 ${target.hour}:00（第 ${rsv.reschedules + 1} 次改签）`)
+      return { ok: true, reschedules: rsv.reschedules + 1 }
+    })
+  })
+}
+
+// 库存原子转移：超售自动改签复用（目标占用 → 单据条件更新 → 原时段释放，同一事务）
+function moveToSlot(rsv, alt) {
+  return runAtomic(() => {
+    const claim = db.prepare(`UPDATE reservation_slots SET booked_count=booked_count+?
+                              WHERE id=? AND status='open' AND capacity+oversell-booked_count>=?`)
+      .run(rsv.qty, alt.id, rsv.qty)
+    if (claim.changes === 0) throw new TxError(RSV_ERR.SLOT_FULL, '备选时段余量不足')
+    const u = db.prepare(`UPDATE reservations SET slot_id=?, slot_day=?, slot_hour=?, reschedules=reschedules+1
+                          WHERE id=? AND status='booked'`)
+      .run(alt.id, alt.day, alt.hour, rsv.id)
+    if (u.changes === 0) throw new TxError(RSV_ERR.STATUS_CONFLICT, '该预约状态已变更，自动改签未执行')
+    db.prepare('UPDATE reservation_slots SET booked_count=MAX(0,booked_count-?) WHERE id=?').run(rsv.qty, rsv.slot_id)
+    logReservation(rsv.id, 'auto_reschedule', `本场超售容量已满，自动改签到 ${alt.day}日 ${alt.hour}:00`)
+    return { ok: true, alt_day: alt.day, alt_hour: alt.hour }
+  })
 }
 
 // ---------------- 核销 ----------------
-// 单个人工核销（运营在闸机/设施口扫码）
-export function checkinReservation(id) {
-  const rsv = getReservation(id)
-  if (!rsv) return { ok: false, msg: '预约不存在' }
-  if (rsv.status === 'checked') return { ok: false, msg: '该预约已核销' }
-  if (rsv.status !== 'booked') return { ok: false, msg: '当前状态不可核销' }
-  // 未到入园时段不可提前核销
-  if (rsv.slot_day > ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour > ctx.hour())) {
-    return { ok: false, msg: `未到入园时段（${rsv.slot_day}日 ${rsv.slot_hour}:00），请按时段核销` }
-  }
-  // 已过时段 2 小时以上视为爽约窗口已过
-  if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour < ctx.hour() - 1)) {
-    return { ok: false, msg: '该预约时段已过，未到场将按爽约处理' }
-  }
-  const slot = getSlot(rsv.slot_id)
-  // 容量内放行；落在超售名额且本场容量已满 → 自动改签，失败则全额退款（返回提示而非放行）
-  if (slot && slot.checked_count + rsv.qty > slot.capacity) {
-    const alt = findAlternativeSlot(rsv)
-    if (alt) {
-      db.prepare('UPDATE reservation_slots SET booked_count=booked_count-? WHERE id=?').run(rsv.qty, rsv.slot_id)
-      db.prepare('UPDATE reservation_slots SET booked_count=booked_count+? WHERE id=?').run(rsv.qty, alt.id)
-      db.prepare(`UPDATE reservations SET slot_id=?, slot_day=?, slot_hour=?, reschedules=reschedules+1 WHERE id=?`)
-        .run(alt.id, alt.day, alt.hour, rsv.id)
-      logReservation(rsv.id, 'auto_reschedule', `本场超售容量已满，自动改签到 ${alt.day}日 ${alt.hour}:00`)
-      return { ok: false, msg: `本场容量已满，已为您自动改签到 ${alt.day}日 ${alt.hour}:00` }
+// 单个人工核销（运营在闸机/设施口扫码）；requestId 幂等，重复扫码不重复放行
+export function checkinReservation(id, requestId = '') {
+  return idempotent('checkin', requestId, () => {
+    const rsv = getReservation(id)
+    if (!rsv) return fail(RSV_ERR.NOT_FOUND, '预约不存在')
+    if (rsv.status === 'checked') return fail(RSV_ERR.STATUS_CONFLICT, '该预约已核销，请勿重复扫码')
+    if (rsv.status !== 'booked') return fail(RSV_ERR.STATUS_CONFLICT, '当前状态不可核销（可能已退款/爽约）')
+    // 未到入园时段不可提前核销
+    if (rsv.slot_day > ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour > ctx.hour())) {
+      return fail(RSV_ERR.CHECKIN_EARLY, `未到入园时段（${rsv.slot_day}日 ${rsv.slot_hour}:00），请按时段核销`)
     }
-    const r = refundReservation(rsv, 'overbook', '本场超售且无后续时段可改签，全额退款')
-    return { ok: false, msg: `本场容量已满且无可改签时段，已全额退款 ¥${r.back}` }
-  }
-  applyCheckin(rsv, slot, 'manual')
-  return { ok: true }
+    // 已过时段 2 小时以上视为爽约窗口已过
+    if (rsv.slot_day < ctx.day() || (rsv.slot_day === ctx.day() && rsv.slot_hour < ctx.hour() - 1)) {
+      return fail(RSV_ERR.CHECKIN_LATE, '该预约时段已过，未到场将按爽约处理')
+    }
+    const slot = getSlot(rsv.slot_id)
+    // 容量内放行；落在超售名额且本场容量已满 → 自动改签，失败则全额退款（返回业务提示而非放行）
+    if (slot && slot.checked_count + rsv.qty > slot.capacity) {
+      const alt = findAlternativeSlot(rsv)
+      if (alt) {
+        const mv = moveToSlot(rsv, alt)
+        if (!mv.ok) return mv
+        return fail(RSV_ERR.OVERBOOK_MOVED, `本场容量已满，已为您自动改签到 ${mv.alt_day}日 ${mv.alt_hour}:00`)
+      }
+      const r = refundReservation(rsv, 'overbook', '本场超售且无后续时段可改签，全额退款')
+      return fail(RSV_ERR.OVERBOOK_REFUNDED, `本场容量已满且无可改签时段，已全额退款 ¥${r.back ?? 0}`)
+    }
+    return runAtomic(() => {
+      applyCheckin(rsv, slot, 'manual')
+      return { ok: true }
+    })
+  })
 }
 
+// 核销落库：状态条件更新（仅 booked → checked），重复/并发调用命中 0 行抛错回滚
 function applyCheckin(rsv, slot, source) {
-  db.prepare("UPDATE reservations SET status='checked', checked_tick=? WHERE id=?").run(ctx.tick(), rsv.id)
+  const u = db.prepare("UPDATE reservations SET status='checked', checked_tick=? WHERE id=? AND status='booked'")
+    .run(ctx.tick(), rsv.id)
+  if (u.changes === 0) throw new TxError(RSV_ERR.STATUS_CONFLICT, '该预约已被其他操作处理（核销/退款/爽约），请刷新查看最新状态')
   if (slot) db.prepare('UPDATE reservation_slots SET checked_count=checked_count+? WHERE id=?').run(rsv.qty, slot.id)
   logReservation(rsv.id, 'checkin', `${source === 'manual' ? '闸机扫码' : '到场自动'}核销 ${rsv.qty} 人`)
 }
 
 // 自动核销当前小时到期的预约：容量内放行；超出容量的超售名额先自动改签后段，再不行全额退款+投诉
-// 返回 { entry: 实际入园人数, ride: Map<rideId, 游玩人数>, displaced: 被安置/退款人数 }
+// 每单独立事务 + 单点容错：一单处理失败不影响其余预约，失败计数随结果返回
+// 返回 { entry: 实际入园人数, ride: Map<rideId, 游玩人数>, displaced: 被安置/退款人数, errors: 失败单数 }
 export function autoCheckin(hour) {
   const day = ctx.day()
   const due = db.prepare("SELECT * FROM reservations WHERE status='booked' AND slot_day=? AND slot_hour=?").all(day, hour)
   const entryArrivals = { qty: 0 }
   const rideArrivals = new Map()
   let displaced = 0
+  let errors = 0
 
   for (const rsv of due) {
-    const slot = getSlot(rsv.slot_id)
-    // 模拟到场率：未到场者留给小时末爽约处理
-    if (rsv.source !== 'manual' && Math.random() > CHECKIN_RATE) continue
+    try {
+      const slot = getSlot(rsv.slot_id)
+      // 模拟到场率：未到场者留给小时末爽约处理
+      if (rsv.source !== 'manual' && Math.random() > CHECKIN_RATE) continue
 
-    const within = slot && slot.checked_count + rsv.qty <= slot.capacity
-    if (within) {
-      applyCheckin(rsv, slot, 'auto')
-      if (rsv.scope === 'entry') entryArrivals.qty += rsv.qty
-      else rideArrivals.set(rsv.ride_id, (rideArrivals.get(rsv.ride_id) || 0) + rsv.qty)
-      continue
-    }
-    // 超售：尝试同日后续有空余的时段
-    const alt = findAlternativeSlot(rsv)
-    if (alt) {
-      db.prepare('UPDATE reservation_slots SET booked_count=booked_count-? WHERE id=?').run(rsv.qty, rsv.slot_id)
-      db.prepare('UPDATE reservation_slots SET booked_count=booked_count+? WHERE id=?').run(rsv.qty, alt.id)
-      db.prepare(`UPDATE reservations SET slot_id=?, slot_day=?, slot_hour=?, reschedules=reschedules+1 WHERE id=?`)
-        .run(alt.id, alt.day, alt.hour, rsv.id)
-      logReservation(rsv.id, 'auto_reschedule', `本场超售容量已满，自动改签到 ${alt.day}日 ${alt.hour}:00`)
-      displaced += rsv.qty
-    } else {
-      refundReservation(rsv, 'overbook', '本场超售且无后续时段可改签，全额退款')
-      displaced += rsv.qty
+      const within = slot && slot.checked_count + rsv.qty <= slot.capacity
+      if (within) {
+        const r = runAtomic(() => { applyCheckin(rsv, slot, 'auto'); return { ok: true } })
+        if (!r.ok) { errors++; continue }   // 状态冲突（如刚被人工退款）：跳过本单
+        if (rsv.scope === 'entry') entryArrivals.qty += rsv.qty
+        else rideArrivals.set(rsv.ride_id, (rideArrivals.get(rsv.ride_id) || 0) + rsv.qty)
+        continue
+      }
+      // 超售：尝试同日后续有空余的时段（库存原子转移）
+      const alt = findAlternativeSlot(rsv)
+      const mv = alt ? moveToSlot(rsv, alt) : { ok: false }
+      if (mv.ok) {
+        displaced += rsv.qty
+      } else {
+        // 无可改签或备选时段被占满 → 全额退款兜底（事务内完成）
+        refundReservation(rsv, 'overbook', '本场超售且无后续时段可改签，全额退款')
+        displaced += rsv.qty
+      }
+    } catch (e) {
+      errors++
+      console.error(`[reservations] 自动核销预约 #${rsv.id} 处理失败（已跳过，不影响其他预约）:`, e)
     }
   }
-  return { entry: entryArrivals.qty, ride: rideArrivals, displaced }
+  return { entry: entryArrivals.qty, ride: rideArrivals, displaced, errors }
 }
 
 // 为超售预约寻找当前或未来仍开放、真实容量有余（非超售名额）的同类时段
@@ -301,19 +427,24 @@ function findAlternativeSlot(rsv) {
 }
 
 // 爽约：所有已过时段未核销的预约（含跨天兜底）标记 noshow，预收款没收（记入「违约」），释放爽约计数
+// 整批一个事务；状态条件更新保证与退款/核销并发时不会重复没收
 export function expireNoShow(hour) {
   const day = ctx.day()
   const due = db.prepare(`SELECT * FROM reservations WHERE status='booked'
                           AND (slot_day<? OR (slot_day=? AND slot_hour<?))`).all(day, day, hour)
   let qty = 0
-  for (const rsv of due) {
-    db.prepare("UPDATE reservations SET status='noshow', reason='noshow', closed_tick=?, closed_day=? WHERE id=?")
-      .run(ctx.tick(), day, rsv.id)
-    db.prepare('UPDATE reservation_slots SET noshow_count=noshow_count+? WHERE id=?').run(rsv.qty, rsv.slot_id)
-    ctx.logFinance?.(day, '违约', rsv.amount, `预约 ${rsv.code} 爽约，预收款没收`)
-    logReservation(rsv.id, 'noshow', `未在 ${rsv.slot_hour}:00 时段到场核销，按爽约处理，预收 ¥${rsv.amount} 不退`)
-    qty += rsv.qty
-  }
+  runAtomic(() => {
+    for (const rsv of due) {
+      const u = db.prepare("UPDATE reservations SET status='noshow', reason='noshow', closed_tick=?, closed_day=? WHERE id=? AND status='booked'")
+        .run(ctx.tick(), day, rsv.id)
+      if (u.changes === 0) continue   // 已被退款/核销等并发处理，跳过
+      db.prepare('UPDATE reservation_slots SET noshow_count=noshow_count+? WHERE id=?').run(rsv.qty, rsv.slot_id)
+      ctx.logFinance?.(day, '违约', rsv.amount, `预约 ${rsv.code} 爽约，预收款没收`)
+      logReservation(rsv.id, 'noshow', `未在 ${rsv.slot_hour}:00 时段到场核销，按爽约处理，预收 ¥${rsv.amount} 不退`)
+      qty += rsv.qty
+    }
+    return { ok: true }
+  })
   return qty
 }
 
@@ -390,14 +521,15 @@ export function listSlots({ scope = 'entry', rideId = null, day = null } = {}) {
 }
 
 // 运营调度：调容量 / 超售额度 / 开关时段；调减不得低于已预约量
+// 关闭时段 = 关时段 + 在途预约批量全额退款 + 投诉，同一事务提交（不会时段关了款没退完）
 export function updateSlot(id, patch) {
   const s = getSlot(id)
-  if (!s) return { ok: false, msg: '时段不存在' }
+  if (!s) return fail(RSV_ERR.SLOT_NOT_FOUND, '时段不存在')
   const sets = []
   const vals = []
   if (patch.capacity !== undefined) {
     const cap = Math.max(0, Math.round(num(patch.capacity)))
-    if (cap < s.booked_count) return { ok: false, msg: `容量不可低于已预约人数 ${s.booked_count}` }
+    if (cap < s.booked_count) return fail(RSV_ERR.STATUS_CONFLICT, `容量不可低于已预约人数 ${s.booked_count}`)
     sets.push('capacity=?'); vals.push(cap)
   }
   if (patch.oversell !== undefined) {
@@ -406,7 +538,12 @@ export function updateSlot(id, patch) {
   }
   if (patch.status !== undefined) {
     const st = ['open', 'closed'].includes(patch.status) ? patch.status : 'open'
-    if (st === 'closed') {
+    sets.push('status=?'); vals.push(st)
+  }
+  if (!sets.length) return fail(RSV_ERR.STATUS_CONFLICT, '无更新项')
+
+  return runAtomic(() => {
+    if (patch.status === 'closed') {
       // 关闭时段：在途预约园方全额退款并生成投诉
       const pending = db.prepare("SELECT * FROM reservations WHERE slot_id=? AND status='booked'").all(id)
       if (pending.length) {
@@ -415,12 +552,10 @@ export function updateSlot(id, patch) {
           { title: `${ride ? ride.name : '分时入园'} · 时段临时取消`, category: ride ? 'facility' : 'service' })
       }
     }
-    sets.push('status=?'); vals.push(st)
-  }
-  if (!sets.length) return { ok: false, msg: '无更新项' }
-  vals.push(id)
-  db.prepare(`UPDATE reservation_slots SET ${sets.join(',')} WHERE id=?`).run(...vals)
-  return { ok: true }
+    vals.push(id)
+    db.prepare(`UPDATE reservation_slots SET ${sets.join(',')} WHERE id=?`).run(...vals)
+    return { ok: true }
+  })
 }
 
 export function listReservations({ status = null, scope = null, day = null, limit = 120 } = {}) {
@@ -450,22 +585,24 @@ export function reservationLogs(id) {
   return db.prepare('SELECT * FROM reservation_logs WHERE reservation_id=? ORDER BY id').all(id)
 }
 
-// 游客端下单校验入口
-export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest' }) {
-  const slot = getSlot(num(slotId))
-  if (!slot) return { ok: false, msg: '时段不存在' }
-  if (scope !== slot.scope || (scope === 'ride' && slot.ride_id !== num(rideId))) {
-    return { ok: false, msg: '预约类型与时段不匹配' }
-  }
-  if (slot.day < ctx.day() || (slot.day === ctx.day() && slot.hour < ctx.hour())) {
-    return { ok: false, msg: '不可预约已过期的时段' }
-  }
-  const q = Math.max(1, Math.min(20, Math.round(num(qty, 1))))
-  const ride = scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(slot.ride_id) : null
-  if (scope === 'ride' && (!ride || ride.status !== 'operating')) return { ok: false, msg: '该设施当前不开放预约' }
-  const price = scope === 'entry' ? entryPrice() : ridePrice(ride)
-  const amount = q * price
-  return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source })
+// 游客端下单校验入口；requestId 幂等：同一请求号重复提交（双击/重试/刷新重发）只建一单、只收一次款
+export function createReservation({ scope, rideId, slotId, qty, guest_name, guest_phone, source = 'guest', requestId = '' }) {
+  return idempotent('create', requestId, () => {
+    const slot = getSlot(num(slotId))
+    if (!slot) return fail(RSV_ERR.SLOT_NOT_FOUND, '时段不存在')
+    if (scope !== slot.scope || (scope === 'ride' && slot.ride_id !== num(rideId))) {
+      return fail(RSV_ERR.SLOT_MISMATCH, '预约类型与时段不匹配')
+    }
+    if (slot.day < ctx.day() || (slot.day === ctx.day() && slot.hour < ctx.hour())) {
+      return fail(RSV_ERR.SLOT_PAST, '不可预约已过期的时段')
+    }
+    const q = Math.max(1, Math.min(20, Math.round(num(qty, 1))))
+    const ride = scope === 'ride' ? db.prepare('SELECT * FROM rides WHERE id=?').get(slot.ride_id) : null
+    if (scope === 'ride' && (!ride || ride.status !== 'operating')) return fail(RSV_ERR.RIDE_UNAVAILABLE, '该设施当前不开放预约')
+    const price = scope === 'entry' ? entryPrice() : ridePrice(ride)
+    const amount = q * price
+    return bookSlot(slot, { guest_name, guest_phone, qty: q, amount, scope, rideId: slot.ride_id, source })
+  })
 }
 
 export function reservationStats() {

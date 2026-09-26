@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "concurrently -k -n SERVER,WEB -c blue,green \"node server/index.js\" \"vite\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test server/reservations.test.js"
   },
   "dependencies": {
     "express": "^4.19.2",
